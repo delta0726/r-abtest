@@ -3,9 +3,20 @@
 # Chapter   : 3章 傾向スコアを用いた分析
 # Objective : TODO
 # Created by: Owner
-# Created on: 2021/2/9
-# Page      : P118 - P130
+# Created on: 2021/09/09
+# Page      : P92 - P118
 #***************************************************************************************
+
+
+# ＜傾向スコアとは＞
+# - 共変量を1次元に圧縮した際の介入変数の割り当て確率のことをいう
+#   --- 傾向スコアを利用して｢マッチング｣や｢ウエイト付け｣を行うことで共変量のバランスを取るツール
+#   --- 介入グループ(Y1)と非介入グループ(Y0)を比較可能な状態にすることが目的
+
+
+# ＜共変量のバランス＞
+# - 介入変数(1/0)のそれぞれで共変量の平均の差がゼロ付近になっているのが好ましい
+#   --- love.plot()はそれを可視化したプロットを作成する
 
 
 # ＜目次＞
@@ -27,7 +38,11 @@ library(MatchIt)
 library(WeightIt)
 library(cobalt)
 library(Matching)
+library(conflicted)
 
+
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
 
 # データ取り込み
 email_data <- read_csv("http://www.minethatdata.com/Kevin_Hillstrom_MineThatData_E-MailAnalytics_DataMiningChallenge_2008.03.20.csv")
@@ -92,11 +107,10 @@ ps_model %>% augment(type.predict = "response")
 # 3 傾向スコアマッチング ---------------------------------------------------------------
 
 # ＜ポイント＞
-# - 傾向スコアマッチングは介入が行われているグループからサンプルを取り出し、
-#   そのサンプルと近い傾向を持つサンプルを介入が行われていないグループからマッチングしてペアを作成する
+# - 介入グループからサンプルを取り出し、それと近い傾向のサンプルを非介入グループから抽出してペアを作成する
 #   --- マッチングさせることでセレクションバイアスを排除
 #   --- マッチングしたペアは均等ウエイトで評価する(効果 = Y1 - Y0)
-#   --- 傾向スコアをY1とY0で完全に一致させるには最適化が必要（マッチングによるペア作成で簡素化）
+#   --- マッチングしなかったサンプルは削除される（絞り込みにより近づけている）
 
 # 元データの確認
 #     0     1
@@ -137,6 +151,15 @@ PSM_result %>% print()
 
 # 4 逆確率重み付き推定（IPW） ----------------------------------------------------------
 
+# ＜ポイント＞
+# - 傾向スコアをサンプルのウエイトとして利用して、介入有無のそれぞれを真の状態に近づける
+#   --- 傾向スコアの逆数をウエイトにしてY1/Y0の期待値を推定する
+
+# 元データの確認
+#     0     1
+# 14665 17198
+biased_data$treatment %>% table()
+
 # 重みの推定
 weighting <-
   weightit(treatment ~ recency + history + channel,
@@ -145,7 +168,7 @@ weighting <-
            estimand = "ATE")
 
 # プロット作成
-# --- 重み付きデータでの共変量のバランス
+# --- Adjustは平均の差がゼロ付近になっている（X軸は平均の差）
 weighting %>% love.plot(threshold = .1)
 
 # 重み付きデータでの効果の推定
@@ -157,45 +180,64 @@ IPW_result <-
 
 # 5 統計モデルを用いたメールの配信のログを分析 -----------------------------------------
 
+# ＜ポイント＞
+# - 傾向スコアをログとして残しておくと事後分析で活用できる可能性が高い
+#   --- 以降では、機械学習システムが出力した傾向スコアのログを想定して分析する
+
+# ＜該当ページ＞
+# P111 - 118
+
+
+# 基礎データ
+# --- 男性向けのメール配信の有無のデータ
+male_df <-
+  email_data %>%
+    filter(segment != "Womens E-Mail") %>%
+    mutate(treatment = ifelse(segment == "Mens E-Mail", 1, 0))
+
 # 乱数シードの設定
 set.seed(1)
 
-# 抽出レコードのサンプリング
+# サンプリング
+# --- データ分割に使用
+# --- ランダムに半数のレコードを抽出（非復元抽出）
 train_flag <-
   male_df %>%
     nrow() %>%
-    sample(nrow(male_df)/2, replace = FALSE)
+    sample(nrow(male_df) / 2, replace = FALSE)
 
 # データ分割
-male_df_train <-
-  male_df[train_flag, ] %>%
-    filter(treatment == 0)
+# --- 訓練データ（過去のデータ、メール配信されていないレコードのみ抽出）
+# --- 検証データ（未来のデータ）
+male_df_train <- male_df[train_flag, ] %>% filter(treatment == 0)
+male_df_test  <- male_df[-train_flag, ]
 
-male_df_test <-
-  male_df[-train_flag, ]
-
+# データ確認
+male_df_train %>%
+  select(conversion, recency, history_segment, channel, zip_code)
 
 # モデル構築
-# --- 売上が発生する確率を予測するモデル
+# --- メールが配信されていない場合に売上が発生する確率を予測するロジスティック回帰モデル
 predict_model <-
   glm(conversion ~ recency + history_segment + channel + zip_code,
       data = male_df_train, family = binomial)
 
 # 確率の予測
-# --- 売上の発生確率からメールの配信確率を決める
+# --- メールが配信されていない場合に売上が発生する確率
 pred_cv <-
   predict_model %>%
     predict(newdata = male_df_test,
             type = "response")
 
-# 確率の変換
-# --- パーセントランク
+# パーセントランクの算出
+# --- 全てのサンプルの予測値の大きさが下から何％に当たるのかを算出
 pred_cv_rank <-
   pred_cv %>%
     percent_rank()
 
-# メール配信
-# --- 配信確率を元にメールの配信を決める
+# メール配信フラグを作成
+# --- 配信確率のパーセントランクを元にメールの配信を決める
+# --- rbinom関数による二項分布の乱数を使用
 mail_assign <-
   pred_cv_rank %>%
     sapply(rbinom, n = 1, size = 1)
@@ -209,18 +251,26 @@ ml_male_df <-
              (treatment == 0 & mail_assign == 0) )
 
 
-## 実験をしていた場合の平均の差を確認
-rct_male_lm <-
-   lm(spend ~ treatment, data = male_df_test) %>%
-     tidy()
+# RCTと平均の比較 ----------------------------------------------------------------
 
-## 平均の比較
-ml_male_lm <-
-   lm(spend ~ treatment, data = ml_male_df) %>%
-     tidy()
+# 介入変数のみで回帰
+# --- 未来のデータを使用（male_df_test）
+rct_male_lm <- lm(spend ~ treatment, data = male_df_test)
 
-# 傾向スコアマッチングの推定(TPS) -----------------------------------------------------
+# 確認
+rct_male_lm %>% tidy()
 
+
+# セレクションバイアスの影響を受けていると考えられる平均の比較
+ml_male_lm <- lm(spend ~ treatment, data = ml_male_df)
+
+# 確認
+ml_male_lm %>% tidy()
+
+
+# 傾向スコアマッチングの推定(TPS) --------------------------------------------------
+
+# 傾向スコアマッチング
 PSM_result <-
   Match(Y = ml_male_df$spend,
         Tr = ml_male_df$treatment,
@@ -229,6 +279,7 @@ PSM_result <-
 
 ## 推定結果の表示
 PSM_result %>% summary()
+
 
 ## IPWの推定
 W.out <-
