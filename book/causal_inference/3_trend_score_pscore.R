@@ -187,9 +187,13 @@ IPW_result <-
 # ＜該当ページ＞
 # P111 - 118
 
+# データ準備 -------------------------------------------------------------
+
+# ＜ポイント＞
+# - P114の図に基づいてデータを作成
 
 # 基礎データ
-# --- 男性向けのメール配信の有無のデータ
+# --- 男性向けのメール配信の有無のデータを作成
 male_df <-
   email_data %>%
     filter(segment != "Womens E-Mail") %>%
@@ -198,7 +202,7 @@ male_df <-
 # 乱数シードの設定
 set.seed(1)
 
-# サンプリング
+# ランダムサンプリング
 # --- データ分割に使用
 # --- ランダムに半数のレコードを抽出（非復元抽出）
 train_flag <-
@@ -218,6 +222,7 @@ male_df_train %>%
 
 # モデル構築
 # --- メールが配信されていない場合に売上が発生する確率を予測するロジスティック回帰モデル
+# --- conversion：メールが配信されて2週間以内に購入したか？
 predict_model <-
   glm(conversion ~ recency + history_segment + channel + zip_code,
       data = male_df_train, family = binomial)
@@ -237,12 +242,29 @@ pred_cv_rank <-
 
 # メール配信フラグを作成
 # --- 配信確率のパーセントランクを元にメールの配信を決める
-# --- rbinom関数による二項分布の乱数を使用
+# --- rbinom関数のprob引数にクラス確率を投入して二項乱数を生成
+# --- sapplyはpred_cv_rankの個々の要素に対して乱数生成を行ってからベクトルに結合している
+# --- 参考：https://teramonagi.hatenablog.com/entry/20120923/1348398652
 mail_assign <-
   pred_cv_rank %>%
     sapply(rbinom, n = 1, size = 1)
 
+# 参考：上記の式は以下と等価
+mail_assign2 <-
+  pred_cv_rank %>%
+    sapply(function(x) rbinom(n = 1, size = 1, prob = x))
+
+# 参考：データイメージ
+# --- クラス確率のパーセントランクに対応して0/1の割合が変化するようにデータを作成
+tibble(pred_cv_rank  = pred_cv_rank,
+       pred_cv_range = round(pred_cv_rank, 1),
+       rbinom_1      = pred_cv_rank %>% sapply(rbinom, n = 1, size = 1)) %>%
+  select(pred_cv_range, rbinom_1) %>%
+  table()
+
 # 配信ログの作成
+# --- メールが配信されている（予測値が一定以上）
+# --- メールが配信されいない（予測値が一定以下）
 ml_male_df <-
   male_df_test %>%
     mutate(mail_assign = mail_assign,
@@ -250,18 +272,26 @@ ml_male_df <-
     filter((treatment == 1 & mail_assign == 1) |
              (treatment == 0 & mail_assign == 0) )
 
+# データ確認
+ml_male_df %>%
+  select(treatment, mail_assign) %>%
+  table()
+
 
 # RCTと平均の比較 ----------------------------------------------------------------
 
-# 介入変数のみで回帰
-# --- 未来のデータを使用（male_df_test）
+# RCTの場合の効果
+# --- 介入変数のみで回帰（未来のデータを使用：male_df_test）
+# --- spend：購入した際の購入額
 rct_male_lm <- lm(spend ~ treatment, data = male_df_test)
 
 # 確認
 rct_male_lm %>% tidy()
 
 
-# セレクションバイアスの影響を受けていると考えられる平均の比較
+# 平均の場合の効果
+# --- 介入変数のみで回帰（未来のデータのうちフィルタしたもの：ml_male_df）
+# --- spend：購入した際の購入額
 ml_male_lm <- lm(spend ~ treatment, data = ml_male_df)
 
 # 確認
@@ -272,9 +302,9 @@ ml_male_lm %>% tidy()
 
 # 傾向スコアマッチング
 PSM_result <-
-  Match(Y = ml_male_df$spend,
+  Match(Y  = ml_male_df$spend,
         Tr = ml_male_df$treatment,
-        X = ml_male_df$ps,
+        X  = ml_male_df$ps,
         estimand = "ATT")
 
 ## 推定結果の表示
